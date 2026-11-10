@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Студия озвучки</title>
+<style>
+:root{--bg:#0f1117;--card:#1a1d27;--line:#2a2f3d;--ink:#f2f3f7;--muted:#9097a8;--acc:#ffb020;--rec:#ff3b4a;--ok:#2fc46b}
+*{box-sizing:border-box;margin:0}
+body{background:var(--bg);color:var(--ink);font:16px/1.4 -apple-system,system-ui,"Segoe UI",Roboto,sans-serif;padding:16px 16px 120px;max-width:640px;margin:0 auto}
+h1{font-size:22px;margin:4px 0 2px}
+.sub{color:var(--muted);font-size:14px;margin-bottom:14px}
+select{width:100%;background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:12px;padding:12px;font-size:16px;margin-bottom:10px}
+.roles{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+.roles button{flex:1 1 auto;background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:12px;padding:10px 12px;font-size:15px}
+.roles button.on{background:var(--acc);color:#111;border-color:var(--acc);font-weight:700}
+.hint{color:var(--acc);font-size:14px;margin:4px 0 14px}
+.tips{background:var(--card);border-radius:12px;padding:10px 12px;color:var(--muted);font-size:13px;margin-bottom:14px}
+.line{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px;margin-bottom:12px}
+.line.done{border-color:var(--ok)}
+.line .how{color:var(--acc);font-size:13px;text-transform:uppercase;letter-spacing:.03em}
+.line .txt{font-size:21px;font-weight:700;margin:6px 0 12px}
+.line .ctx{color:var(--muted);font-size:13px;margin-bottom:8px}
+.row{display:flex;gap:10px;align-items:center}
+.rec{width:64px;height:64px;border-radius:50%;border:4px solid var(--ink);background:var(--rec);flex:none;font-size:0}
+.rec.on{border-radius:14px;animation:p 1s infinite}
+@keyframes p{50%{opacity:.6}}
+.play{background:none;border:1px solid var(--line);color:var(--ink);border-radius:12px;padding:10px 14px;font-size:15px}
+.st{color:var(--muted);font-size:14px}
+.meter{height:6px;background:var(--line);border-radius:3px;overflow:hidden;margin-top:10px;display:none}
+.meter i{display:block;height:100%;width:0;background:var(--ok)}
+.bar{position:fixed;left:0;right:0;bottom:0;background:#0f1117ee;border-top:1px solid var(--line);padding:12px 16px calc(12px + env(safe-area-inset-bottom))}
+.bar button{width:100%;max-width:608px;display:block;margin:0 auto;background:var(--ok);color:#06210f;border:0;border-radius:14px;padding:15px;font-size:17px;font-weight:800}
+.bar button:disabled{background:var(--line);color:var(--muted)}
+.err{background:#3a1218;color:#ffb3ba;border-radius:12px;padding:10px 12px;margin-bottom:12px;display:none}
+</style>
+</head>
+<body>
+<h1>🎙 Студия озвучки</h1>
+<div class="sub">Выбери серию и свою роль. Записывай реплики по одной, переписывай сколько угодно, в конце жми «Отправить».</div>
+<div class="err" id="err"></div>
+<select id="ep"></select>
+<div class="roles" id="roles"></div>
+<div class="hint" id="hint"></div>
+<div class="tips">Тихое место, телефон в 15–20 см ото рта, без эха (шкаф с одеждой — идеально). Играй, а не читай: шёпот — шёпотом, ор — ором. Если микрофон не включается — открой ссылку в Safari/Chrome.</div>
+<div id="list"></div>
+<div class="bar"><button id="send" disabled>Отправить</button></div>
+<script src="episodes.js"></script>
+<script>
+const $ = s => document.querySelector(s);
+const q = new URLSearchParams(location.search);
+let ep = EPISODES.find(e => e.id === q.get("ep")) || EPISODES[EPISODES.length - 1];
+let role = q.get("role");
+const takes = {};          // key -> Blob (последний дубль)
+let stream = null, rec = null, recKey = null, chunks = [], meterRAF = 0;
+
+// ---------- хранение дублей в IndexedDB (чтобы не терять при перезагрузке)
+const DB = new Promise(res => {
+  try {
+    const r = indexedDB.open("ozvuchka", 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("takes");
+    r.onsuccess = () => res(r.result); r.onerror = () => res(null);
+  } catch (e) { res(null); }
+});
+async function dbPut(k, v) { const d = await DB; if (!d) return; try { d.transaction("takes", "readwrite").objectStore("takes").put(v, k); } catch (e) {} }
+async function dbDel(k) { const d = await DB; if (!d) return; try { d.transaction("takes", "readwrite").objectStore("takes").delete(k); } catch (e) {} }
+async function dbGet(k) {
+  const d = await DB; if (!d) return null;
+  return new Promise(res => { try { const r = d.transaction("takes").objectStore("takes").get(k); r.onsuccess = () => res(r.result || null); r.onerror = () => res(null); } catch (e) { res(null); } });
+}
+
+function err(msg) { const e = $("#err"); e.textContent = msg; e.style.display = msg ? "block" : "none"; }
+function mime() {
+  for (const m of ["audio/mp4", "audio/webm;codecs=opus", "audio/webm", "audio/ogg"])
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) return m;
+  return "";
+}
+function ext(type) { return type.includes("mp4") ? "m4a" : type.includes("ogg") ? "ogg" : "webm"; }
+
+function renderHeader() {
+  $("#ep").innerHTML = EPISODES.map(e => `<option value="${e.id}" ${e === ep ? "selected" : ""}>${e.title}</option>`).join("");
+  const used = [...new Set(ep.lines.map(l => l.role))];
+  if (!used.includes(role)) role = used[0];
+  $("#roles").innerHTML = used.map(r => `<button data-r="${r}" class="${r === role ? "on" : ""}">${ep.roles[r].name}</button>`).join("");
+  $("#hint").textContent = ep.roles[role].hint;
+  history.replaceState(null, "", `?ep=${ep.id}&role=${role}`);
+}
+
+async function renderList() {
+  const idx = ep.lines.map((l, i) => [l, i]).filter(([l]) => l.role === role);
+  $("#list").innerHTML = idx.map(([l, i]) => {
+    const prev = ep.lines[i - 1];
+    const ctx = prev && prev.role !== role ? `<div class="ctx">перед этим: ${ep.roles[prev.role].name} — «${prev.text}»</div>` : "";
+    return `<div class="line" id="L_${l.key}">${ctx}<div class="how">${l.how}</div><div class="txt">${l.text}</div>
+      <div class="row"><button class="rec" data-k="${l.key}">rec</button>
+      <button class="play" data-p="${l.key}" style="display:none">▶ Слушать</button>
+      <span class="st" id="S_${l.key}">нажми и говори</span></div>
+      <div class="meter" id="M_${l.key}"><i></i></div></div>`;
+  }).join("");
+  for (const [l] of idx) {
+    const b = takes[`${ep.id}_${l.key}`] || await dbGet(`${ep.id}_${l.key}`);
+    if (b) { takes[`${ep.id}_${l.key}`] = b; mark(l.key, b); }
+  }
+  updateSend();
+}
+
+function mark(key, blob) {
+  $(`#L_${key}`).classList.add("done");
+  $(`[data-p="${key}"]`).style.display = "";
+  $(`#S_${key}`).textContent = `✓ записано (${(blob.size / 1024).toFixed(0)} КБ) — можно перезаписать`;
+}
+function mine() { return ep.lines.filter(l => l.role === role); }
+function updateSend() {
+  const n = mine().filter(l => takes[`${ep.id}_${l.key}`]).length, all = mine().length;
+  const b = $("#send"); b.disabled = n === 0;
+  b.textContent = n ? `Отправить (${n} из ${all})` : "Отправить";
+}
+
+async function getStream() {
+  if (stream) return stream;
+  stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, autoGainControl: false, noiseSuppression: true } });
+  return stream;
+}
+
+function meter(key, s) {
+  const el = $(`#M_${key}`); el.style.display = "block";
+  const ac = new (window.AudioContext || window.webkitAudioContext)();
+  const an = ac.createAnalyser(); an.fftSize = 512; ac.createMediaStreamSource(s).connect(an);
+  const buf = new Uint8Array(an.fftSize);
+  const tick = () => {
+    an.getByteTimeDomainData(buf);
+    let m = 0; for (const v of buf) m = Math.max(m, Math.abs(v - 128));
+    el.firstChild.style.width = Math.min(100, m / 1.28) + "%";
+    el.firstChild.style.background = m > 120 ? "var(--rec)" : "var(--ok)";
+    meterRAF = requestAnimationFrame(tick);
+  };
+  tick();
+  return () => { cancelAnimationFrame(meterRAF); ac.close(); el.style.display = "none"; };
+}
+
+let stopMeter = null;
+async function toggle(key) {
+  err("");
+  if (rec && rec.state === "recording") { rec.stop(); return; }
+  try { await getStream(); } catch (e) { err("Нет доступа к микрофону. Разреши микрофон в настройках браузера или открой ссылку в Safari/Chrome."); return; }
+  const type = mime();
+  rec = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
+  recKey = key; chunks = [];
+  rec.ondataavailable = e => e.data.size && chunks.push(e.data);
+  rec.onstop = () => {
+    stopMeter && stopMeter();
+    $(`[data-k="${key}"]`).classList.remove("on");
+    const blob = new Blob(chunks, { type: rec.mimeType || type || "audio/webm" });
+    if (blob.size < 2000) { $(`#S_${key}`).textContent = "слишком коротко, запиши ещё раз"; return; }
+    const id = `${ep.id}_${key}`; takes[id] = blob; dbPut(id, blob); mark(key, blob); updateSend();
+  };
+  rec.start();
+  $(`[data-k="${key}"]`).classList.add("on");
+  $(`#S_${key}`).textContent = "● идёт запись — нажми ещё раз, чтобы остановить";
+  stopMeter = meter(key, stream);
+}
+
+let player = null;
+function play(key) {
+  const b = takes[`${ep.id}_${key}`]; if (!b) return;
+  if (player) player.pause();
+  player = new Audio(URL.createObjectURL(b)); player.play();
+}
+
+async function send() {
+  const files = mine().filter(l => takes[`${ep.id}_${l.key}`]).map(l => {
+    const b = takes[`${ep.id}_${l.key}`];
+    return new File([b], `${ep.id}_${l.key}.${ext(b.type)}`, { type: b.type });
+  });
+  if (navigator.canShare && navigator.canShare({ files })) {
+    try { await navigator.share({ files, title: `Озвучка ${ep.title} — ${ep.roles[role].name}` }); return; }
+    catch (e) { if (e.name === "AbortError") return; }
+  }
+  // запасной путь: скачать файлы по одному
+  for (const f of files) {
+    const a = document.createElement("a"); a.href = URL.createObjectURL(f); a.download = f.name;
+    document.body.appendChild(a); a.click(); a.remove(); await new Promise(r => setTimeout(r, 400));
+  }
+  err("Файлы скачаны — отправь их в Telegram как файлы (скрепка → Файл).");
+}
+
+document.addEventListener("click", e => {
+  const t = e.target.closest("button"); if (!t) return;
+  if (t.dataset.r) { role = t.dataset.r; renderHeader(); renderList(); }
+  else if (t.dataset.k) toggle(t.dataset.k);
+  else if (t.dataset.p) play(t.dataset.p);
+  else if (t.id === "send") send();
+});
+$("#ep").onchange = e => { ep = EPISODES.find(x => x.id === e.target.value); renderHeader(); renderList(); };
+if (!window.MediaRecorder) err("Этот браузер не умеет записывать звук. Открой ссылку в Safari (iPhone) или Chrome (Android).");
+renderHeader(); renderList();
+</script>
+</body>
+</html>
